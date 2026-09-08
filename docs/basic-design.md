@@ -11,37 +11,38 @@
 ### データフロー & モジュール構成図
 
       +-------------------------------------------------------------+
-      |                       外部データソース                         |
+      |                      外部データソース                        |
       +-------------------------------------------------------------+
-        | 国土交通省 API                  | 気象庁/民間気象API (将来拡張)
+        | 国土交通省 API                  | 気象庁 AMeDAS (JSON API)
         v                                 v
       +-------------------------------------------------------------+
-      | [Data Ingestion Component]                                  |
-      |  - River Water Level Fetcher (新富士見橋)                    |
-      |  - Weather Data Fetcher (狭山雨量・飯能雨量・線状降水帯)       |
+      | [Data Ingestion Component] (src/ingestion/)                 |
+      |  - River Water Level Fetcher (riverApiClient.ts)            |
+      |  - Weather Data Fetcher (weatherApiClient.ts)              |
+      |    (狭山観測所: 43241 / 飯能観測所: 43226)                  |
       +-------------------------------------------------------------+
         |                                 |
         +----------------+                |
                          |                |
                          v                v
       +-------------------------------------------------------------+
-      | [GIS Location Analyzer Component]                           |
-      |  - GeoJSON Spatial Evaluator (Turf.js)                       |
-      |  - Area Hazard Weight Extractor                              |
-      |    (GIS/GeoJSON Data: unoki_4_41.json)                     |
+      | [GIS Hazard Context Component] (src/gis/)                   |
+      |  - Static Home Hazard Provider (hazardAnalyzer.ts)          |
+      |    (xx地区 固有ハザード定数: H = 2.5)               |
       +-------------------------------------------------------------+
                          |
                          v
       +-------------------------------------------------------------+
-      | [Risk Evaluation Engine Component]                          |
+      | [Risk Evaluation Engine Component] (src/engine/)            |
       |  - Sudden Rain Risk Evaluator (内水計算: Score = I * H)     |
       |  - Comprehensive Risk Evaluator (外水・内水・上流統合判定)    |
+      |    (riskEvaluator.ts)                                        |
       +-------------------------------------------------------------+
                          |
                          v
       +-------------------------------------------------------------+
-      | [Output / Alert Interface]                                  |
-      |  - Risk Alert Model (レベル1〜4メッセージ出力)               |
+      | [Output / Alert Interface] (src/index.ts)                   |
+      |  - Console Output & Risk Alert Model (レベル1〜4出力)        |
       +-------------------------------------------------------------+
 
 ---
@@ -51,21 +52,23 @@
 ### 3.1 データ取得モジュール (`Ingestion Module`)
 
 #### `fetchShinfujimiWaterLevel(): Promise<WaterLevelObservation null |>`
-- **概要:** 国土交通省「川の防災情報」Web APIより、新富士見橋観測所（obsCd: 108, ofcCd: 2817）のリアルタイム水位(m)を取得する。
+- **概要:** 国土交通省「川の防災情報」Web APIより、新富士見橋観測所（obsCd: 108, ofcCd: 2817）のリアルタイム水位(m)を取得する（※現在モック化対応）。
 - **入力:** なし
 - **出力:** `WaterLevelObservation`（観測時刻、水位数値）
 
-#### `fetchWeatherData(): Promise<WeatherData>` *(インターフェース定義)*
-- **概要:** 狭山市の1時間/10分間雨量、飯能市山間部の3時間累計雨量、線状降水帯発生フラグを取得する。
+#### `fetchWeatherData(): Promise<JmaWeatherData>`
+- **概要:** 気象庁の公開JSONエンドポイントより最新の観測時刻テキスト（`latest_time.txt`）を取得し、狭山観測所（`43241`）の10分/1時間雨量、および飯能観測所（`43226`）の3時間累計雨量を動的に自動取得・抽出する。
+- **入力:** なし
+- **出力:** `JmaWeatherData` (`sayama10minRain`, `sayamaHourlyRain`, `hannoCumulativeRain`, `hasLinearRainband`)
 
 ---
 
-### 3.2 空間解析モジュール (`GIS Module`)
+### 3.2 空間・ハザードモジュール (`GIS Module`)
 
-#### `evaluateLocationHazard(userLocation: GeoPoint): HazardContext`
-- **概要:** ユーザーのGPS座標(`[経度, 緯度]`)と管理対象のGeoJSONポリゴン群を `Turf.js` の `booleanPointInPolygon` で空間照合し、対象エリア内か否かの判定および地形重み係数($H$)を出力する。
-- **入力:** `userLocation` (`{ latitude: number, longitude: number }`)
-- **出力:** `HazardContext` (`isInside: boolean`, `hazardLevelDepth: number`, `hazardWeight: number`, `areaProperties: object`)
+#### `getHomeHazardContext(): HazardContext`
+- **概要:** 自宅（狭山市xx地区）に最適化された不動の地理的定数（宅地盛土高度、実績浸水深、地形ハザード重み）を取得する。固定地点向け管理システムのため、動的なGPS座標照合処理を廃止し定数参照へ簡略化。
+- **入力:** なし
+- **出力:** `HazardContext` (`isInside: true`, `areaName`, `minDepth: 0.1`, `maxDepth: 0.5`, `hazardWeight: 2.5`)
 
 ---
 
@@ -73,18 +76,16 @@
 
 #### `calculateSuddenRainRisk(data: SuddenRainData): RiskResult`
 - **概要:** 突発的豪雨（内水氾濫）の短期リスクを計算する。
-- **計算式:** $\text{スコア } (R) = \text{短時間降雨強度係数 } (I) \times \text{地形・ハザード重み } (H)$
+- **計算式:** スコア $(R) =$ 短時間降雨強度係数 $(I) \times$ 地形・ハザード重み $(H)$
 - **ルール:**
   - Effective Rain: $\max(\text{60分雨量}, \text{10分雨量} \times 6)$
   - 降雨強度係数 ($I$):
-    - $\ge 80\text{mm/h} \Rightarrow 8.0$ （H28台風9号級）
-    - $\ge 50\text{mm/h} \Rightarrow 4.0$ （下水道排水能力限界）
-    - $\ge 30\text{mm/h} \Rightarrow 2.0$ （側溝溢水注意）
+    - $\ge 80\text{mm/h} \Rightarrow 8.0$ （H28台風9号級・猛烈な大雨）
+    - $\ge 50\text{mm/h} \Rightarrow 4.0$ （下水道排水能力限界・激しい雨）
+    - $\ge 30\text{mm/h} \Rightarrow 2.0$ （2019年等で確認された内水注意レベル）
     - $< 30\text{mm/h} \Rightarrow 1.0$
   - ハザード重み ($H$):
-    - 浸水想定 $\ge 0.5\text{m} \Rightarrow 2.5$ （鵜の木4-41等）
-    - 浸水想定 $> 0\text{m} \Rightarrow 1.5$
-    - ハザードなし $\Rightarrow 1.0$
+    - 鵜の木4-41地区（段丘下低地・内水脆弱性） $\Rightarrow 2.5$
 
 #### `evaluateUnoki4_41_Risk(data: EnvironmentalData): RiskAlert`
 - **概要:** 外水（入間川水位）、内水（狭山雨量）、上流降雨（飯能雨量）、線状降水帯フラグを統合評価し、警戒レベル（レベル1〜4）を決定する。
@@ -96,9 +97,43 @@
 
 ---
 
-## 4. データ構造定義 (Interfaces / Schemas)
+## 4. データソース仕様（気象庁 AMeDAS JSON）
 
-```typescript
+### 4.1 採用データソース
+- **名称:** 気象庁 防災情報 WEB表示用 AMeDAS リアルタイムJSONデータ
+- **観測所:**
+  - 狭山観測所（観測所コード: `43241`）- 近隣雨量の即時監視
+  - 飯能観測所（観測所コード: `43226`）- 入間川上流山間部の豪雨監視
+
+### 4.2 選定理由
+1. **信頼性と即時性:** 気象庁の地域気象観測システム（アメダス）公式データであり、10分ごとに高精度な観測値が自動更新されるため。
+2. **導入・運用コストの軽さ:** APIキーの取得手続きや認証トークン更新処理が不要で、HTTP GETによる直接取得が可能なため。
+3. **データ軽量性:** JSON形式で提供され、TypeScript/JavaScriptによる解析・処理が極めて容易であるため。
+
+### 4.3 取り込みフォーマット（データ構造）
+本システムでは、以下の2段階のエンドポイントを連動させて取り込みを行っている。
+
+1. **時刻案内インデックス:**
+   - **URL:** `[https://www.jma.go.jp/bosai/amedas/data/latest_time.txt](https://www.jma.go.jp/bosai/amedas/data/latest_time.txt)`
+   - **形式:** プレーンテキスト（ISO 8601形式文字列: `YYYY-MM-DDTHH:mm:ss+09:00`）
+2. **観測データ本体:**
+   - **URL:** `[https://www.jma.go.jp/bosai/amedas/data/map/](https://www.jma.go.jp/bosai/amedas/data/map/){YYYYMMDDHHMM00}.json`
+   - **形式:** JSON Key-Value 形式（観測所コードをキーとするオブジェクト）
+   - **データ構造概念図:**
+     {
+       "43241": {
+         "precipitation10m": [6.0, 0],  // [10分間雨量(mm), 品質情報]
+         "precipitation60m": [0.0, 0]   // [1時間雨量(mm), 品質情報]
+       },
+       "43226": {
+         "precipitation3h": [0.0, 0]    // [3時間累計雨量(mm), 品質情報]
+       }
+     }
+
+---
+
+## 5. データ構造定義 (Interfaces / Schemas)
+
 // 1. 環境・観測データ
 export interface EnvironmentalData {
   sayamaHourlyRain: number;      // 狭山市 1時間雨量 (mm/h)
@@ -108,21 +143,24 @@ export interface EnvironmentalData {
   hasLinearRainband: boolean;    // 線状降水帯フラグ
 }
 
-// 2. GIS・ハザードコンテキスト
-export interface GeoPoint {
-  longitude: number; // 経度
-  latitude: number;  // 緯度
+// 2. 気象庁アメダスデータモデル
+export interface JmaWeatherData {
+  sayama10minRain: number;
+  sayamaHourlyRain: number;
+  hannoCumulativeRain: number;
+  hasLinearRainband: boolean;
 }
 
+// 3. GIS・ハザードコンテキスト
 export interface HazardContext {
   isInside: boolean;
   areaName: string;
   minDepth: number;
   maxDepth: number;
-  hazardWeight: number; // 例: 鵜の木4-41は2.5
+  hazardWeight: number; // 鵜の木4-41は2.5で固定
 }
 
-// 3. 内水計算入力・出力データ
+// 4. 内水計算入力・出力データ
 export interface SuddenRainData {
   rain10minMm: number;
   rain60minMm: number;
@@ -136,7 +174,7 @@ export interface RiskResult {
   detail: string;
 }
 
-// 4. 総合評価判定結果
+// 5. 総合評価判定結果
 export interface RiskAlert {
   level: 1 | 2 | 3 | 4;
   title: string;
@@ -144,7 +182,9 @@ export interface RiskAlert {
   timestamp: string;
 }
 
-## 5. 定数・水防基準値リファレンス
+---
+
+## 6. 定数・水防基準値リファレンス
 
 本システムで判定基準として使用する主要な閾値一覧です。
 
